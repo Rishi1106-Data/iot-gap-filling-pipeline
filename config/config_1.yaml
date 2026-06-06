@@ -1,0 +1,111 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# IoT Gap-Filling Pipeline — configuration
+# Change file paths and device-specific values here; no code changes needed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+timeline:
+  frequency: 5min
+
+execution:
+  train_mode: true        # true = run tournament + train + save; false = load saved models
+
+gaps:
+  isolated_max: 1         # gaps of this size -> interpolation
+  medium_max: 5           # gaps up to this size -> model; larger -> neighbor reconstruction
+
+models:
+  model_dir: models/
+  n_splits: 5
+
+neighbor:
+  quality_reference:
+    - CorrectedTemp
+    - CorrectedHumidity
+    - CorrectedHeatIndex
+
+validation:
+  split_fraction: 0.8
+  gap_sizes: [1, 2, 3, 5]
+  n_gaps: 150
+  seed: 42
+
+# ── Reference variable used for gap classification ─────────────────────────────
+reference:
+  ref_col: CorrectedTemp
+
+# ── Continuous variables to reconstruct (current + corrected) ──────────────────
+continuous_variables:
+  - CurrentTemperature
+  - CorrectedTemp
+  - CurrentHumidity
+  - CorrectedHumidity
+  - AtmPressure
+  - WindSpeed
+
+# ── PLACEHOLDER: per-variable max 5-minute change for continuity validation ────
+jump_thresholds:
+  CurrentTemperature: 3
+  CorrectedTemp: 3
+  CurrentHumidity: 10
+  CorrectedHumidity: 10
+  AtmPressure: 1.5
+  WindSpeed: 10
+
+# ── PLACEHOLDER: physical clip bounds [min, max] per variable ──────────────────
+clipping_ranges:
+  CurrentTemperature: [5, 55]
+  CorrectedTemp: [5, 55]
+  CurrentHumidity: [0, 100]
+  CorrectedHumidity: [0, 100]
+  AtmPressure: [940, 1060]
+  WindSpeed: [0, 60]
+
+# ── PLACEHOLDER: neighbour IDs and distances (km), same order ──────────────────
+neighbor_distances:
+  ids:
+    - "237"
+    - "249"
+  distances_km:
+    - 16.75
+    - 17.5
+
+# ── PLACEHOLDER: input file paths ──────────────────────────────────────────────
+input_paths:
+  target_file: data/Annam_201.csv
+  neighbor_files:
+    - data/Annam_237_201.csv
+    - data/Annam_249_201.csv
+
+# ── PLACEHOLDER: output file paths ─────────────────────────────────────────────
+output_paths:
+  output_dir: outputs/
+  filled_dataset: outputs/filled_dataset.csv
+  audit_report: outputs/audit_report.csv
+  evaluation_report: outputs/evaluation_report.csv
+  neighbor_quality_report: outputs/neighbor_quality_report.csv
+  model_selection_report: outputs/model_selection_report.csv
+
+# ── PLACEHOLDER: model hyperparameters (override per model; merged over defaults)
+model_params:
+  xgboost:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.05
+  lightgbm:
+    n_estimators: 100
+    max_depth: 5
+    learning_rate: 0.05
+  randomforest:
+    n_estimators: 100
+    max_depth: 10
+  knn:
+    n_neighbors: 5
+
+# ── Stored tournament result: best model per variable ──────────────────────────
+# Persisted from training so inference mode is deterministic and model choices
+# stay transparent without reading the Python code.
+model_mapping:
+  CorrectedTemp: XGBoost
+  CorrectedHumidity: LightGBM
+  AtmPressure: LightGBM
+  WindSpeed: RandomForest
