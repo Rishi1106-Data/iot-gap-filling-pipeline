@@ -1,0 +1,125 @@
+{
+  "comment": "Least-privilege IAM policies for the Annam gap-filling stack. Replace ${AccountId}, ${Region}, ${DataBucket}. Each policy is scoped to exactly the resources the layer touches — verified against aws/io_s3.py and aws/io_dynamo.py.",
+
+  "annam-gapfill-task-role-policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "S3RawReadModelsReadWrite",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": [
+          "arn:aws:s3:::${DataBucket}/raw/*",
+          "arn:aws:s3:::${DataBucket}/models/*",
+          "arn:aws:s3:::${DataBucket}/filled/*",
+          "arn:aws:s3:::${DataBucket}/reports/*",
+          "arn:aws:s3:::${DataBucket}/runs/*"
+        ]
+      },
+      {
+        "Sid": "S3ListBucketScopedPrefixes",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::${DataBucket}"],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": ["raw/*", "models/*", "filled/*", "reports/*", "runs/*"]
+          }
+        }
+      },
+      {
+        "Sid": "DynamoMetadataRead",
+        "Effect": "Allow",
+        "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+        "Resource": [
+          "arn:aws:dynamodb:${Region}:${AccountId}:table/annam-sensor-metadata",
+          "arn:aws:dynamodb:${Region}:${AccountId}:table/annam-sensor-metadata/index/gsi_status"
+        ]
+      },
+      {
+        "Sid": "DynamoResultsWrite",
+        "Effect": "Allow",
+        "Action": ["dynamodb:PutItem", "dynamodb:BatchWriteItem"],
+        "Resource": ["arn:aws:dynamodb:${Region}:${AccountId}:table/annam-gapfill-results"]
+      },
+      {
+        "Sid": "CloudWatchMetricsOptionalApiMode",
+        "Effect": "Allow",
+        "Action": ["cloudwatch:PutMetricData"],
+        "Resource": "*",
+        "Condition": { "StringEquals": { "cloudwatch:namespace": "AnnamAI/GapFilling" } }
+      }
+    ]
+  },
+
+  "annam-ecs-execution-role-policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "EcrPullAndLogs",
+        "Effect": "Allow",
+        "Action": [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:CreateLogGroup"
+        ],
+        "Resource": "*"
+      }
+    ]
+  },
+
+  "annam-stepfunctions-role-policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "RunFargateTasksSync",
+        "Effect": "Allow",
+        "Action": ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks"],
+        "Resource": "*"
+      },
+      {
+        "Sid": "PassTaskRoles",
+        "Effect": "Allow",
+        "Action": ["iam:PassRole"],
+        "Resource": [
+          "arn:aws:iam::${AccountId}:role/annam-ecs-execution-role",
+          "arn:aws:iam::${AccountId}:role/annam-gapfill-task-role"
+        ]
+      },
+      {
+        "Sid": "RunTaskSyncEventBridgeManagedRule",
+        "Effect": "Allow",
+        "Action": ["events:PutTargets", "events:PutRule", "events:DescribeRule"],
+        "Resource": "arn:aws:events:${Region}:${AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+      },
+      {
+        "Sid": "ReadBatchesFromS3",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject"],
+        "Resource": "arn:aws:s3:::${DataBucket}/runs/*"
+      },
+      {
+        "Sid": "NotifyFailures",
+        "Effect": "Allow",
+        "Action": ["sns:Publish"],
+        "Resource": "arn:aws:sns:${Region}:${AccountId}:annam-gapfill-failures"
+      }
+    ]
+  },
+
+  "annam-scheduler-role-policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "StartStateMachine",
+        "Effect": "Allow",
+        "Action": ["states:StartExecution"],
+        "Resource": "arn:aws:states:${Region}:${AccountId}:stateMachine:annam-gapfill"
+      }
+    ]
+  }
+}

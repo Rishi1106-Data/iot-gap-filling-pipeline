@@ -4,7 +4,7 @@ from typing import Dict, List, Set, Tuple
 import pandas as pd
 import numpy as np
 
-from gap_analysis import parse_timestamps
+from src.gap_analysis import parse_timestamps
 
 # Composite environmental quality reference (replaces single CurrentTemperature).
 # Quality/coverage/reliability are measured across these corrected variables.

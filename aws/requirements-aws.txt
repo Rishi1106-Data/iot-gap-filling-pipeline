@@ -1,0 +1,6 @@
+# aws/requirements-aws.txt — dependencies the AWS layer adds on top of the
+# pipeline's own requirements.txt. Kept separate so the business-logic deps
+# (pandas / sklearn / xgboost / lightgbm) remain the single source of truth in
+# the repo-root requirements.txt and are never duplicated or version-skewed.
+
+boto3>=1.34,<2

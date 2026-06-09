@@ -1,0 +1,47 @@
+{
+  "family": "annam-run-batch",
+  "comment": "Batch processor: ONE task processes BATCH_SIZE sensors sequentially. Sizing derived from measured ~257 MB peak RSS and ~100-120s/sensor on a single core; 1 vCPU / 2 GB comfortably fits the RF tournament with headroom for the neighbour cache on local disk.",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "ephemeralStorage": { "sizeInGiB": 30 },
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::${AccountId}:role/annam-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::${AccountId}:role/annam-gapfill-task-role",
+  "containerDefinitions": [
+    {
+      "name": "run-batch",
+      "image": "${AccountId}.dkr.ecr.${Region}.amazonaws.com/annam-gapfill:${ImageTag}",
+      "essential": true,
+      "command": ["python", "aws/run_batch.py", "--help"],
+      "environment": [
+        { "name": "AWS_REGION", "value": "${Region}" },
+        { "name": "DATA_BUCKET", "value": "${DataBucket}" },
+        { "name": "SENSOR_TABLE", "value": "annam-sensor-metadata" },
+        { "name": "RESULTS_TABLE", "value": "annam-gapfill-results" },
+        { "name": "CW_NAMESPACE", "value": "AnnamAI/GapFilling" },
+        { "name": "METRICS_MODE", "value": "emf" },
+        { "name": "TRAIN_MODE", "value": "false" },
+        { "name": "BATCH_SIZE", "value": "25" },
+        { "name": "N_SPLITS", "value": "5" },
+        { "name": "VAL_N_GAPS", "value": "150" },
+        { "name": "WORK_DIR", "value": "/tmp/iot" },
+        { "name": "MPLBACKEND", "value": "Agg" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/annam-run-batch",
+          "awslogs-region": "${Region}",
+          "awslogs-stream-prefix": "batch",
+          "awslogs-create-group": "true"
+        }
+      },
+      "stopTimeout": 120
+    }
+  ]
+}

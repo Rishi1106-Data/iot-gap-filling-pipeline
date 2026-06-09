@@ -1,0 +1,128 @@
+# =============================================================================
+# .github/workflows/deploy.yml
+# Test → Build → Push to ECR → Register task defs → Update state machine.
+# Deploy steps run ONLY on push to main AND only if tests pass.
+# Auth via GitHub OIDC (no static AWS keys).
+# =============================================================================
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # OIDC
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: annam-gapfill
+  ECS_CLUSTER: annam-gapfill
+
+jobs:
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (pipeline + AWS layer + test tools)
+        run: |
+          python -m pip install --upgrade pip
+          # requirements.txt.txt is the committed pipeline deps file in this repo
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; \
+          elif [ -f requirements.txt.txt ]; then pip install -r requirements.txt.txt; fi
+          pip install -r aws/requirements-aws.txt
+          pip install pytest moto
+
+      - name: Run pipeline test suite (if present)
+        run: |
+          if [ -d tests ]; then
+            echo "Running existing pytest suite..."
+            python -m pytest tests/ -v --tb=short
+          else
+            echo "No tests/ directory found; skipping unit tests."
+          fi
+
+      - name: Smoke-test AWS layer imports
+        # Guards against breaking the verified import quirk or aws/ modules.
+        run: |
+          python - <<'PY'
+          import ast, glob, sys
+          for f in glob.glob("aws/*.py"):
+              ast.parse(open(f).read())
+              print("syntax OK:", f)
+          # confirm run_batch can wire to the pipeline from repo root
+          import subprocess
+          r = subprocess.run([sys.executable, "aws/run_batch.py", "--help"],
+                             capture_output=True, text=True)
+          assert r.returncode == 0, r.stderr
+          assert "Process a batch of sensors" in r.stdout
+          print("run_batch entrypoint OK")
+          PY
+
+  # ---------------------------------------------------------------------------
+  build-deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f aws/Dockerfile -t "$REGISTRY/$ECR_REPO:$IMAGE_TAG" -t "$REGISTRY/$ECR_REPO:latest" .
+          docker push "$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO:latest"
+
+      - name: Register updated task definitions
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          DATA_BUCKET: ${{ secrets.DATA_BUCKET }}
+        run: |
+          for tdf in infrastructure/ecs/taskdef-run-batch.json infrastructure/ecs/taskdef-list-sensors.json; do
+            tmp="$(mktemp)"
+            sed -e "s/\${AccountId}/$ACCOUNT_ID/g" \
+                -e "s/\${Region}/$AWS_REGION/g" \
+                -e "s/\${DataBucket}/$DATA_BUCKET/g" \
+                -e "s/\${ImageTag}/$IMAGE_TAG/g" "$tdf" > "$tmp"
+            aws ecs register-task-definition --cli-input-json "file://$tmp"
+            rm -f "$tmp"
+          done
+
+      - name: Deploy state machine
+        env:
+          ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          DATA_BUCKET: ${{ secrets.DATA_BUCKET }}
+          SFN_ROLE_ARN: ${{ secrets.SFN_ROLE_ARN }}
+          ECS_CLUSTER_ARN: ${{ secrets.ECS_CLUSTER_ARN }}
+          RUN_BATCH_TASKDEF_ARN: ${{ secrets.RUN_BATCH_TASKDEF_ARN }}
+          LIST_SENSORS_TASKDEF_ARN: ${{ secrets.LIST_SENSORS_TASKDEF_ARN }}
+          PRIVATE_SUBNET_1: ${{ secrets.PRIVATE_SUBNET_1 }}
+          PRIVATE_SUBNET_2: ${{ secrets.PRIVATE_SUBNET_2 }}
+          TASK_SG: ${{ secrets.TASK_SG }}
+          FAILURE_TOPIC_ARN: ${{ secrets.FAILURE_TOPIC_ARN }}
+        run: bash infrastructure/stepfunctions/deploy_statemachine.sh
