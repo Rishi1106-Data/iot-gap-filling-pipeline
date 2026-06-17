@@ -1,0 +1,23 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+tfplan
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfvars
+
+# Environment-specific values — never commit
+terraform.tfvars
+*.auto.tfvars
+
+# Sensitive outputs
+outputs.json
+
+# OS
+.DS_Store

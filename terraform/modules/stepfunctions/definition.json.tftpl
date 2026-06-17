@@ -1,0 +1,171 @@
+{
+  "Comment": "Annam AI gap-filling: discover active sensors, batch them, fan out to Fargate Spot (one task per batch, many sensors per task), with retries and failure notification.",
+  "StartAt": "DiscoverAndBatch",
+  "States": {
+    "DiscoverAndBatch": {
+      "Type": "Task",
+      "Comment": "Runs aws/list_sensors.py on Fargate. Reads ACTIVE sensors from DynamoDB and emits batch descriptors to S3.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ecs_cluster_arn}",
+        "TaskDefinition": "${list_sensors_taskdef_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${private_subnet_1}", "${private_subnet_2}"],
+            "SecurityGroups": ["${task_security_group}"],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "list-sensors",
+              "Command": ["python", "aws/list_sensors.py"],
+              "Environment": [
+                { "Name": "RUN_ID", "Value.$": "$$.Execution.Name" },
+                { "Name": "RUN_DATE", "Value.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)" },
+                { "Name": "TRAIN_MODE", "Value.$": "States.Format('{}', $.train_mode)" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.discovery",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "LoadBatches"
+    },
+
+    "LoadBatches": {
+      "Type": "Task",
+      "Comment": "Load batch manifest written by list_sensors to S3.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket": "${data_bucket}",
+        "Key.$": "States.Format('runs/{}/batches.json', $$.Execution.Name)"
+      },
+      "ResultSelector": {
+        "batches.$": "States.StringToJson($.Body)"
+      },
+      "ResultPath": "$.loaded",
+      "Retry": [
+        { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "ProcessBatches"
+    },
+
+    "ProcessBatches": {
+      "Type": "Map",
+      "Comment": "Fan out: one Fargate Spot task per batch, BATCH_SIZE sensors per task. MaxConcurrency protects DynamoDB/S3 from burst.",
+      "ItemsPath": "$.loaded.batches.batches",
+      "MaxConcurrency": ${map_max_concurrency},
+      "ToleratedFailurePercentage": ${tolerated_failure_percentage},
+      "ItemSelector": {
+        "device_ids.$": "$$.Map.Item.Value.device_ids",
+        "batch_id.$": "$$.Map.Item.Value.batch_id",
+        "run_id.$": "$$.Execution.Name",
+        "run_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+        "train_mode.$": "$.train_mode"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "DISTRIBUTED", "ExecutionType": "STANDARD" },
+        "StartAt": "RunBatch",
+        "States": {
+          "RunBatch": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "Parameters": {
+              "Cluster": "${ecs_cluster_arn}",
+              "TaskDefinition": "${run_batch_taskdef_arn}",
+              "LaunchType": "FARGATE",
+              "CapacityProviderStrategy": [
+                { "CapacityProvider": "FARGATE_SPOT", "Weight": 4 },
+                { "CapacityProvider": "FARGATE", "Weight": 1, "Base": 0 }
+              ],
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ["${private_subnet_1}", "${private_subnet_2}"],
+                  "SecurityGroups": ["${task_security_group}"],
+                  "AssignPublicIp": "DISABLED"
+                }
+              },
+              "Overrides": {
+                "ContainerOverrides": [
+                  {
+                    "Name": "run-batch",
+                    "Command": ["python", "aws/run_batch.py", "--batch-json.$", "States.JsonToString($)"],
+                    "Environment": [
+                      { "Name": "RUN_ID", "Value.$": "$.run_id" },
+                      { "Name": "RUN_DATE", "Value.$": "$.run_date" },
+                      { "Name": "TRAIN_MODE", "Value.$": "States.Format('{}', $.train_mode)" }
+                    ]
+                  }
+                ]
+              }
+            },
+            "Retry": [
+              {
+                "Comment": "Fargate Spot interruptions surface as TaskFailed — retry on a fresh slot.",
+                "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException", "States.Timeout"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.batchError",
+                "Next": "BatchFailed"
+              }
+            ],
+            "End": true
+          },
+          "BatchFailed": {
+            "Type": "Pass",
+            "Parameters": { "status": "failed", "batch_id.$": "$.batch_id", "error.$": "$.batchError" },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.mapResults",
+      "Next": "Summarize"
+    },
+
+    "Summarize": {
+      "Type": "Pass",
+      "Comment": "Terminal success state. ToleratedFailurePercentage governs whether partial failures abort the run.",
+      "End": true
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${failure_topic_arn}",
+        "Subject": "Annam gap-filling pipeline FAILED",
+        "Message.$": "States.Format('Execution {} failed. Error: {}', $$.Execution.Name, $.error)"
+      },
+      "Next": "FailState"
+    },
+
+    "FailState": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "See SNS notification and CloudWatch Logs for details."
+    }
+  }
+}
