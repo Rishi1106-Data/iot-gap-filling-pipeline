@@ -69,8 +69,12 @@ IMEI_PICK = "most_temperature"  # "most_temperature" | None
 # Output — reconstructed rows are written back to DynamoDB (primary destination)
 #
 # The pipeline reads a sensor from its source DynamoDB table, reconstructs the
-# gaps, and inserts ONLY the reconstructed (filled) rows back into that SAME
-# source table. There is no reconstructed dataset in S3 during normal execution.
+# gaps, and inserts ONLY successfully reconstructed rows back into that SAME
+# source table (conditional PutItem: a real reading is never overwritten). Unresolved
+# gap slots are NOT written; they are counted in the metadata table. Rows written by
+# earlier runs (filled_flag = 1) are excluded when series are read, so original
+# observations remain the only source of truth. There is no reconstructed dataset in
+# S3 during normal execution.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Optional S3 debug output. When True, write_output() additionally dumps the
@@ -138,8 +142,8 @@ NEIGHBOR_FEATURE_MAP = {
 # Useful if WS_Data_30_Days-style tables only hold a rolling window anyway.
 START_DATE = os.environ.get("START_DATE")  # e.g. "2026-01-01"
 
-# Run the (expensive) synthetic-gap accuracy evaluation? Off in production;
-# turn on for offline validation runs.
+# RESERVED / NOT CURRENTLY USED: no production code path reads this flag. The
+# synthetic-gap accuracy evaluation exists only in the local pipeline (src/validation.py).
 RUN_EVALUATION = os.environ.get("RUN_EVALUATION", "false").lower() == "true"
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -40,9 +40,12 @@ provider "aws" {
   region = local.region
 }
 
+# Account id comes from the active AWS credentials; nothing account-specific is hard-coded.
+data "aws_caller_identity" "current" {}
+
 locals {
   region     = "us-east-1"
-  account_id = "975048338421"
+  account_id = data.aws_caller_identity.current.account_id
   project    = "annam-recon"
 
   # ── REPLACE these four before apply ──────────────────────────────────────
@@ -59,7 +62,8 @@ locals {
   security_groups  = ["sg-REPLACE_ME"]      # REPLACE
   assign_public_ip = true                   # true for public subnet; false if using private subnet + VPC endpoints
 
-  # S3 bucket for reconstructed output. Must match OUTPUT_BUCKET in config.py.
+  # S3 bucket used ONLY for the optional debug dump (S3_REPORT_ENABLED=true).
+  # Must match OUTPUT_BUCKET in config.py. Normal runs write nothing to S3.
   output_bucket = "annam-reconstructed" # REPLACE if your bucket name differs
 
   # Phase 2 — incremental processing watermark table. Must match METADATA_TABLE
@@ -73,7 +77,7 @@ locals {
 
   # Optional: SNS topic ARN to notify on task failure. Leave "" to skip wiring
   # an alarm action (the alarm is still created and visible in CloudWatch).
-  alarm_sns_topic_arn = "" # e.g. "arn:aws:sns:us-east-1:975048338421:annam-alerts"
+  alarm_sns_topic_arn = "" # e.g. "arn:aws:sns:us-east-1:<ACCOUNT_ID>:annam-alerts"
   # ──────────────────────────────────────────────────────────────────────────
 
   image_tag = "latest"
@@ -186,7 +190,7 @@ resource "aws_cloudwatch_log_group" "task" {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# IAM — execution role (pull image, write logs) + task role (read Dynamo, write S3)
+# IAM — execution role (pull image, write logs) + task role (read/write DynamoDB; optional S3 debug)
 # ──────────────────────────────────────────────────────────────────────────────
 data "aws_iam_policy_document" "ecs_assume" {
   statement {
@@ -215,7 +219,8 @@ resource "aws_iam_role" "task" {
 
 # Least-privilege task policy. Mirrors iam_task_policy.json exactly:
 #   * read the data + neighbor tables (WS_*, SSMet_*, gateway-prediction)
-#   * write ONLY (PutObject) to the output bucket
+#   * write reconstructed rows back to the source tables; PutObject on the
+#     output bucket only for the optional S3 debug dump
 # Scan is included because the sensor-list step is folded into the batch task.
 data "aws_iam_policy_document" "task" {
   statement {
@@ -227,13 +232,14 @@ data "aws_iam_policy_document" "task" {
       "arn:aws:dynamodb:${local.region}:${local.account_id}:table/gateway-prediction",
     ]
   }
-  # The reconstructed (gap-filled) rows are inserted back into the SAME source
-  # data table they were read from, using batch_writer() (BatchWriteItem under
-  # the hood). Only filled rows are written; original readings are never
-  # overwritten. This statement grants that write on the source data tables.
+  # Successfully reconstructed rows are written back into the SAME source data
+  # table they were read from, one conditional PutItem per row: an item is
+  # created only if its key is free or it is itself a previous reconstruction
+  # (filled_flag = 1), so a real reading is never overwritten. Unresolved slots
+  # are not written. Batch writes are not used, so only PutItem is granted.
   statement {
     sid     = "DynamoWriteBackReconstructed"
-    actions = ["dynamodb:BatchWriteItem", "dynamodb:PutItem"]
+    actions = ["dynamodb:PutItem"]
     resources = [
       "arn:aws:dynamodb:${local.region}:${local.account_id}:table/WS_*",
       "arn:aws:dynamodb:${local.region}:${local.account_id}:table/SSMet_*",
@@ -400,7 +406,7 @@ resource "aws_scheduler_schedule" "weekly" {
 
     # If the whole run fails to launch, retry twice. NOTE: a retry re-runs the
     # ENTIRE batch from sensor 1 (there is no checkpoint); sensors already
-    # written to S3 are simply recomputed and overwritten — wasteful but safe.
+    # processed are recomputed; their filled rows are simply re-put (same keys) — wasteful but safe.
     retry_policy {
       maximum_retry_attempts       = 2
       maximum_event_age_in_seconds = 3600
@@ -412,7 +418,7 @@ resource "aws_scheduler_schedule" "weekly" {
 # Failure visibility — a weekly job that fails SILENTLY is the real danger.
 #   run_batch.py exits non-zero only if EVERY sensor failed. This metric filter
 #   + alarm surfaces a fully-failed run; for partial failures, inspect the
-#   batch summary CSV in s3://<bucket>/reconstructed/_batch_runs/.
+#   per-sensor status lines in the CloudWatch logs.
 # ──────────────────────────────────────────────────────────────────────────────
 resource "aws_cloudwatch_log_metric_filter" "batch_all_failed" {
   name           = "${local.project}-all-failed"

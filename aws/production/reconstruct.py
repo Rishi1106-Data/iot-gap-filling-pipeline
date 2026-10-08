@@ -574,16 +574,28 @@ def run_reconstruction(target_df: pd.DataFrame, neighbor_frames: list,
                     main.loc[ts, "confidence_level"] = conf
                     main.loc[ts, "filled_flag"] = 1
 
-    # ── rainfall: conservative zero-fill ──────────────────────────────────────
+    # ── rainfall: conservative, evidence-based zero-fill ──────────────────────
+    # A missing rainfall value becomes 0 only when there is real evidence of a dry
+    # period: at least one OBSERVED value within +/-3 slots of the target series
+    # or from a neighbour at the same slot, and none of the observed values is
+    # positive. Missing values are never read as "dry", and zeros assigned here
+    # are not reused as evidence for later slots (the window is read from a
+    # snapshot of genuine observations), so one observation cannot spread a zero
+    # across a long gap. Slots that were not reconstructed (not original, and the
+    # reference value is still missing) never receive a rainfall value.
     RAIN_VARS = [c for c in config.RAIN_VARS if c in main.columns]
+    unresolved_slot = (main["imputation_method"] != "original") & main[REF].isna()
+    nbr_rain_cols = [f"RainH_{nid}" for nid in NEIGHBOR_IDS
+                     if f"RainH_{nid}" in main.columns]
     for col in RAIN_VARS:
-        for ts in main.index[main[col].isna()]:
+        observed = main[col].to_numpy(dtype=float, copy=True)
+        for ts in main.index[main[col].isna() & ~unresolved_slot]:
             pos = main.index.get_loc(ts)
-            win = main.iloc[max(0, pos - 3):min(len(main), pos + 4)]
-            nbr = [main.loc[ts, f"RainH_{nid}"] for nid in NEIGHBOR_IDS
-                   if f"RainH_{nid}" in main.columns]
-            nbr_dry = all(pd.isna(v) or v == 0 for v in nbr)
-            if win[col].fillna(0).max() == 0 and nbr_dry:
+            evidence = [v for v in observed[max(0, pos - 3):min(len(main), pos + 4)]
+                        if not np.isnan(v)]
+            evidence += [float(main.loc[ts, c]) for c in nbr_rain_cols
+                         if pd.notna(main.loc[ts, c])]
+            if evidence and max(evidence) <= 0:
                 main.loc[ts, col] = 0
 
     # ── continuity correction ─────────────────────────────────────────────────
@@ -602,6 +614,9 @@ def run_reconstruction(target_df: pd.DataFrame, neighbor_frames: list,
             if nb_vals:
                 main.loc[ts, col] = 0.6 * main.loc[ts, col] + 0.4 * np.mean(nb_vals)
 
+    # filled_flag = 1 means "this row is not an original observation" (it may be
+    # reconstructed OR unresolved). It is NOT a persistence decision: the production
+    # writer uses io_dynamo.reconstruction_masks() (method + reference value) for that.
     main["filled_flag"] = np.where(main["imputation_method"] == "original", 0, 1)
     t_recon += time.perf_counter() - _t_recon
 

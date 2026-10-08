@@ -1,3 +1,5 @@
+# NOTE: legacy image for the earlier S3 + Step Functions design (not the production path).
+# The production image is aws/production/Dockerfile (build context: aws/production/).
 # =============================================================================
 # aws/Dockerfile — IoT Gap-Filling Pipeline (AWS Fargate image)
 # =============================================================================

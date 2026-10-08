@@ -1,12 +1,12 @@
 """
 list_sensors.py — Produce the list of sensor keys to reconstruct.
 
-Step Functions' Map state needs an array of items to fan out over. This scans
-WS_Spatial_Neighbors and emits every deviceId_topic key. Run it as a small
-Lambda (or the first Fargate task) at the start of the daily run.
+Scans WS_Spatial_Neighbors and returns every deviceId_topic key. It is imported
+by run_batch.py (sensor discovery step of the scheduled batch).
 
-Output: JSON list of {"SENSOR_KEY": "<id#topic>"} to stdout, which Step
-Functions can consume directly as the Map ItemsPath.
+Running this file directly prints the keys as JSON ({"SENSOR_KEY": ...} items).
+lambda_handler is a leftover from an earlier design and is NOT deployed: this
+package contains no Lambda function and no Step Functions state machine.
 """
 
 import json

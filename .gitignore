@@ -1,15 +1,37 @@
+# Python
 __pycache__/
-*.pyc
-
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
 .ipynb_checkpoints/
 
-models/*.joblib
-models/*.pkl
+# Secrets / local config — never commit credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+.aws/
 
+# Terraform state and local variable files (may contain account-specific values)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Generated artefacts
+models/
 outputs/
 reports/
-
 *.log
-.env
+*.zip
 
+# OS / editor
 .DS_Store
+.idea/
+.vscode/

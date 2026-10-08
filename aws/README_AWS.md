@@ -1,3 +1,5 @@
+> **Status: earlier design (not the current production path).** This document describes the first AWS design — S3 CSV inputs/outputs, DynamoDB sensor-metadata/results tables and a Step Functions fan-out wrapped around `src/`. The current production implementation lives in [`aws/production/`](production/DEPLOY.md) (DynamoDB as the source *and* destination, one scheduled ECS Fargate task, no Step Functions/Lambda). This file is kept for reference.
+
 # AWS Deployment Layer — Annam AI Gap-Filling Pipeline
 
 This deployment layer wraps your **existing, unchanged** pipeline (`src/`,

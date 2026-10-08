@@ -1,10 +1,13 @@
-# IoT Gap-Filling Pipeline — runtime dependencies (Python 3.10+)
+# IoT Gap-Filling Pipeline — runtime dependencies for the local / development
+# pipeline (run_pipeline.py + src/). Python 3.10+.
+# The AWS production container has its own list: aws/production/requirements.txt
+# Test tooling lives in requirements-dev.txt.
 
-# Core Data Processing
+# Core data processing
 pandas>=2.0,<3.1
 numpy>=1.24,<3
 
-# Machine Learning
+# Machine learning
 scikit-learn>=1.3,<2
 xgboost>=2.0,<4
 lightgbm>=4.0,<5
@@ -13,7 +16,5 @@ joblib>=1.3,<2
 # Configuration
 PyYAML>=6.0,<7
 
-# Visualization
+# Visualisation (MAE-vs-gap-size plot)
 matplotlib>=3.7,<4
-
-pytest>=8.0
