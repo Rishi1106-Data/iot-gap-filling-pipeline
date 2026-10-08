@@ -1,15 +1,16 @@
 """
 run_sensor.py — Entrypoint for the Annam reconstruction pipeline on AWS.
 
-A single Fargate task reconstructs ONE sensor. The orchestration layer
-(Step Functions Map state) invokes this once per sensor, in parallel.
+Reconstructs ONE sensor. This is a local / manual debugging helper: the
+scheduled production job runs run_batch.py, which loops over every sensor in a
+single process. (An earlier design fanned out one task per sensor with Step
+Functions; that is no longer used by this production package.)
 
 Usage (local / container):
     python run_sensor.py --device-key "205#WS/SSMet_0126/205"
     python run_sensor.py --device-id 205 --topic "WS/SSMet_0126/205"
 
-It reads the device-key from the SENSOR_KEY env var if no CLI arg is given,
-which is how the Step Functions Map state passes each item in.
+It reads the device-key from the SENSOR_KEY env var if no CLI arg is given.
 """
 
 import argparse
@@ -103,8 +104,9 @@ def run_sensor(device_key: str) -> dict:
     # 5. Write reconstructed rows back to the source DynamoDB table
     #    (+ optional S3 debug report, disabled by default).
     _t = time.perf_counter()
-    io.write_output(device_id, result["final_df"], result["reports"],
-                    target_table)
+    write_stats = io.write_output(device_id, result["final_df"],
+                                  result["reports"], target_table)
+    counts = io.summarize_reconstruction(result["final_df"], write_stats)
     t["write_s"] = round(time.perf_counter() - _t, 2)
 
     t.update(result.get("timings", {}))
@@ -112,11 +114,10 @@ def run_sensor(device_key: str) -> dict:
     _log_timing(device_key, t)
 
     rows = len(result["final_df"])
-    filled = int(result["final_df"]["filled_flag"].sum())
-    log.info("Done: %d rows, %d filled (interval %g min)",
-             rows, filled, result["interval_min"])
-    return {"device": device_key, "status": "ok",
-            "rows": rows, "filled": filled}
+    log.info("Done: %d rows, %d filled, %d unresolved (interval %g min)",
+             rows, counts["filled"], counts["unresolved"], result["interval_min"])
+    return {"device": device_key, "status": "ok", "rows": rows,
+            "filled": counts["filled"], "unresolved": counts["unresolved"]}
 
 
 def main():
@@ -139,5 +140,10 @@ def main():
 
     result = run_sensor(key)
     log.info("Result: %s", result)
-    # Non-zero exit on failure so Step Functions can retry the task.
-    # 
+    # Non-zero exit when the sensor could not be reconstructed (no data).
+    if result["status"] not in ("ok", "skipped_no_gaps"):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

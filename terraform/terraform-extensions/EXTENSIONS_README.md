@@ -1,3 +1,5 @@
+> **Status: earlier design (not the current production path).** This document describes the first AWS design — S3 CSV inputs/outputs, DynamoDB sensor-metadata/results tables and a Step Functions fan-out wrapped around `src/`. The current production implementation lives in [`aws/production/`](../../aws/production/DEPLOY.md) (DynamoDB as the source *and* destination, one scheduled ECS Fargate task, no Step Functions/Lambda). This file is kept for reference.
+
 # Terraform Extensions — Annam AI Pipeline
 
 These files **extend** the existing `terraform/` infrastructure without

@@ -18,6 +18,7 @@ from decimal import Decimal
 import boto3
 import pandas as pd
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 
 import config
@@ -111,6 +112,113 @@ def _to_float(v):
         return float(v)
     except (TypeError, ValueError):
         return float("nan")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reconstructed vs original records
+#
+# Original sensor observations are the source of truth. Rows this pipeline wrote
+# earlier carry filled_flag = 1 and an imputation_method. They are excluded when a
+# series is loaded (so a later run never trains on, or reconstructs from, its own
+# earlier output), and only rows that were reconstructed successfully are written.
+# ──────────────────────────────────────────────────────────────────────────────
+# imputation_method values that denote a successful reconstruction. "unresolved"
+# and "original" are deliberately absent.
+RECONSTRUCTED_METHODS = ("interpolation", "model", "neighbor")
+
+
+def _drop_reconstructed(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows previously written by this pipeline (reconstructed or placeholder).
+
+    A row counts as non-original when filled_flag == 1 or imputation_method is one
+    of the reconstruction methods / "unresolved". Raw device readings carry neither
+    attribute and are always kept.
+    """
+    drop = pd.Series(False, index=df.index)
+    if "filled_flag" in df.columns:
+        drop |= df["filled_flag"].map(_to_float).eq(1)
+    if "imputation_method" in df.columns:
+        drop |= df["imputation_method"].isin(RECONSTRUCTED_METHODS + ("unresolved",))
+    n = int(drop.sum())
+    if n:
+        log.debug("Excluded %d previously reconstructed row(s) from the input series", n)
+    return df[~drop]
+
+
+def _is_reconstructed_item(item: dict) -> bool:
+    """True for an item this pipeline wrote earlier (reconstructed or placeholder)."""
+    return (_to_float(item.get("filled_flag")) == 1
+            or item.get("imputation_method") in RECONSTRUCTED_METHODS + ("unresolved",))
+
+
+def _newest_original_item(table_name: str, device_id: str, projection: str | None = None,
+                          names: dict | None = None, page_size: int = 25,
+                          max_pages: int = 8) -> dict | None:
+    """Newest item for the device that is an ORIGINAL observation.
+
+    Reconstructed rows are skipped, so they can never stand in for the latest real
+    reading (watermark probe) or supply identity attributes. Reads at most
+    page_size * max_pages items from the newest end; returns None if there is no
+    original in that range (callers treat that as "process the sensor").
+    """
+    table = _dynamo.Table(table_name)
+    kwargs = {"KeyConditionExpression": Key(config.DATA_PK).eq(str(device_id)),
+              "ScanIndexForward": False, "Limit": page_size}
+    if projection:
+        kwargs["ProjectionExpression"] = projection + ", #ff, #im"
+        kwargs["ExpressionAttributeNames"] = {**(names or {}),
+                                              "#ff": "filled_flag", "#im": "imputation_method"}
+    for _ in range(max_pages):
+        resp = table.query(**kwargs)
+        for item in resp.get("Items", []):
+            if not _is_reconstructed_item(item):
+                return item
+        if "LastEvaluatedKey" not in resp:
+            return None
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    return None
+
+
+def reconstruction_masks(final_df: pd.DataFrame):
+    """Split a reconstruction result into (persist_mask, unresolved_mask).
+
+    persist_mask    : rows reconstructed successfully — imputation_method is one of
+                      RECONSTRUCTED_METHODS AND the reference value is not null.
+                      Only these rows are written to DynamoDB.
+    unresolved_mask : every other non-original row (gap slots that could not be
+                      reconstructed). These are counted, never written.
+    filled_flag keeps its existing meaning (0 = original, 1 = non-original) and is
+    not used here.
+    """
+    empty = pd.Series(dtype=bool)
+    if (final_df is None or final_df.empty
+            or "imputation_method" not in final_df.columns):
+        return empty, empty
+    method = final_df["imputation_method"]
+    if config.REF_COL in final_df.columns:
+        ref_ok = final_df[config.REF_COL].notna()
+    else:
+        ref_ok = pd.Series(False, index=final_df.index)
+    persist = method.isin(RECONSTRUCTED_METHODS) & ref_ok
+    unresolved = (method != "original") & ~persist
+    return persist, unresolved
+
+
+def summarize_reconstruction(final_df: pd.DataFrame, write_stats: dict) -> dict:
+    """Counts for one sensor, kept separate so unresolved slots never look filled.
+
+    filled           : reconstructed rows actually written to the source table
+    unresolved       : gap slots that could not be reconstructed (not written)
+    skipped_existing : reconstructed rows not written because a real item exists
+    gap_count        : all gap slots found = filled + skipped_existing + unresolved
+    """
+    persist, unresolved = reconstruction_masks(final_df)
+    n_unres = int(unresolved.sum()) if len(unresolved) else 0
+    n_ok = int(persist.sum()) if len(persist) else 0
+    return {"filled": int(write_stats.get("written", 0)),
+            "unresolved": n_unres,
+            "skipped_existing": int(write_stats.get("skipped_existing", 0)),
+            "gap_count": n_ok + n_unres}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -262,6 +370,13 @@ def load_series(device_id: str, table_name: str,
 
     df = pd.DataFrame(raw)
 
+    # Original observations only: never feed previously reconstructed rows (or
+    # unresolved placeholders) back in as if they were real readings.
+    df = _drop_reconstructed(df)
+    if df.empty:
+        log.warning("No original rows for device %s in %s", device_id, table_name)
+        return pd.DataFrame()
+
     # Optional IMEI handling (the two-units-per-DeviceId problem)
     if config.IMEI_ATTR in df.columns:
         if config.IMEI_FILTER:
@@ -326,16 +441,17 @@ def write_output(device_id: str, final_df: pd.DataFrame, reports: dict,
     the optional S3 report is written only when config.S3_REPORT_ENABLED is set.
     """
     # Primary output: reconstructed rows -> source DynamoDB table.
-    write_filled_to_dynamo(device_id, final_df, target_table)
+    stats = write_filled_to_dynamo(device_id, final_df, target_table)
 
     # Optional, debug-only S3 dump of the full dataset + reports. Off by default
     # so normal execution never writes a reconstructed dataset to S3.
     if getattr(config, "S3_REPORT_ENABLED", False):
         write_s3_debug_report(device_id, final_df, reports)
+    return stats
 
 
 def _representative_source_item(target_table: str, device_id: str) -> dict:
-    """Fetch one recent original row for the device (all attributes) so its
+    """Fetch the newest ORIGINAL row for the device (all attributes) so its
     static identity attributes can be carried onto reconstructed rows.
 
     Best-effort: returns {} on empty/failure, in which case reconstructed rows
@@ -345,54 +461,52 @@ def _representative_source_item(target_table: str, device_id: str) -> dict:
     if not (getattr(config, "PRESERVE_SOURCE_ATTRS", None) or []):
         return {}
     try:
-        table = _dynamo.Table(target_table)
-        resp = table.query(
-            KeyConditionExpression=Key(config.DATA_PK).eq(str(device_id)),
-            ScanIndexForward=False,
-            Limit=1,
-        )
+        return _newest_original_item(target_table, device_id) or {}
     except Exception as exc:
         log.warning("Representative-row read failed for %s in %s: %s "
                     "(reconstructed rows will omit preserved attrs)",
                     device_id, target_table, exc)
         return {}
-    items = resp.get("Items", [])
-    return items[0] if items else {}
+
+
+# A reconstructed item may be created if the key is free, or may replace an item
+# that is itself a previous reconstruction (filled_flag = 1). It can never replace
+# a real device reading, which has no filled_flag attribute.
+_WRITE_CONDITION = "attribute_not_exists(#pk) OR #ff = :one"
 
 
 def write_filled_to_dynamo(device_id: str, final_df: pd.DataFrame,
-                           target_table: str):
-    """Write ONLY reconstructed (filled_flag == 1) rows back to `target_table`.
+                           target_table: str) -> dict:
+    """Write ONLY successfully reconstructed rows back to `target_table`.
 
-    Uses batch_writer() for efficient batched inserts (it auto-batches into
-    groups of 25 and retries unprocessed items). Original rows (filled_flag == 0)
-    are never written, so genuine source readings are never overwritten.
+    A row is written iff reconstruction_masks() marks it as persistable: its
+    imputation_method is interpolation / model / neighbor AND the reference value
+    is not null. Unresolved slots are never written (they are counted by the
+    caller and recorded in the metadata table instead), and original rows are
+    never written.
 
-    Each written record carries:
+    Each item is written with a conditional PutItem so a real reading that
+    arrived after this run read the table (same DeviceId + TimeStamp key) is
+    never overwritten; such rows are skipped and counted. Batch writes do not
+    support conditions, so items are put one at a time. Items carry:
       * the primary key (DeviceId + TimeStamp);
-      * every reconstructed weather value present on the row — CONT_VARS *and*
-        RAIN_VARS (rainfall is reconstructed too, so it must be persisted now
-        that DynamoDB is the sole output);
-      * the reconstruction metadata (imputation_method, confidence_level,
-        filled_flag) that marks the row as a fill; and
-      * the static device-identity attributes in config.PRESERVE_SOURCE_ATTRS
-        (e.g. Topic, Latitude, Longitude, IMEINumber), copied from a
-        representative source row so downstream consumers and the pipeline's own
-        IMEI re-read keep working. Time-varying telemetry is intentionally not
-        fabricated for a synthetic gap timestamp.
+      * every reconstructed weather value present on the row (CONT_VARS and
+        RAIN_VARS, non-null only);
+      * imputation_method, confidence_level and filled_flag = 1, which also lets
+        load_series() exclude them on later runs;
+      * the static device-identity attributes in config.PRESERVE_SOURCE_ATTRS,
+        copied from a representative source row. Time-varying telemetry is
+        intentionally not fabricated.
+
+    Returns {"written": int, "skipped_existing": int}.
     """
-    if final_df is None or final_df.empty or "filled_flag" not in final_df.columns:
+    stats = {"written": 0, "skipped_existing": 0}
+    persist, _unresolved = reconstruction_masks(final_df)
+    if persist.empty or not persist.any():
         log.info("No reconstructed rows to write for device %s", device_id)
-        return
+        return stats
+    filled = final_df[persist]
 
-    filled = final_df[final_df["filled_flag"] == 1]
-    if filled.empty:
-        log.info("No filled rows for device %s; nothing to insert into %s",
-                 device_id, target_table)
-        return
-
-    # Static identity attributes to carry onto reconstructed rows (real values
-    # from a representative source row; never the PK/SK, which we set below).
     preserve_attrs = getattr(config, "PRESERVE_SOURCE_ATTRS", None) or []
     rep = _representative_source_item(target_table, device_id) if preserve_attrs else {}
     preserved = {k: rep[k] for k in preserve_attrs
@@ -404,33 +518,43 @@ def write_filled_to_dynamo(device_id: str, final_df: pd.DataFrame,
 
     value_cols = list(config.CONT_VARS) + list(config.RAIN_VARS)
     table = _dynamo.Table(target_table)
-    written = 0
+    names = {"#pk": config.DATA_PK, "#ff": "filled_flag"}
+    values = {":one": Decimal("1")}
     try:
-        with table.batch_writer() as bw:
-            for ts, row in filled.iterrows():
-                # Seed with static identity attrs, then set the authoritative
-                # key / reconstructed values / metadata (these always win).
-                item = dict(preserved)
-                item[config.DATA_PK] = str(device_id)
-                item[config.DATA_SK] = ts.strftime("%Y-%m-%d %H:%M:%S")
-                for col in value_cols:
-                    if col in row and pd.notna(row[col]):
-                        item[col] = Decimal(str(round(float(row[col]), 4)))
-                # Preserve reconstruction metadata on the written record.
-                item["imputation_method"] = str(row.get("imputation_method", ""))
-                item["confidence_level"] = str(row.get("confidence_level", ""))
-                item["filled_flag"] = Decimal(str(int(row.get("filled_flag", 1))))
-                bw.put_item(Item=item)
-                written += 1
+        for ts, row in filled.iterrows():
+            item = dict(preserved)
+            item[config.DATA_PK] = str(device_id)
+            item[config.DATA_SK] = ts.strftime("%Y-%m-%d %H:%M:%S")
+            for col in value_cols:
+                if col in row and pd.notna(row[col]):
+                    item[col] = Decimal(str(round(float(row[col]), 4)))
+            item["imputation_method"] = str(row.get("imputation_method", ""))
+            item["confidence_level"] = str(row.get("confidence_level", ""))
+            item["filled_flag"] = Decimal("1")
+            try:
+                table.put_item(Item=item, ConditionExpression=_WRITE_CONDITION,
+                               ExpressionAttributeNames=names,
+                               ExpressionAttributeValues=values)
+                stats["written"] += 1
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    stats["skipped_existing"] += 1
+                else:
+                    raise
     except Exception as exc:
         # Losing reconstructed output silently is the worst outcome — raise so
-        # the task fails and Step Functions / the batch runner records it.
+        # the batch runner records this sensor as failed.
         log.error("DynamoDB write-back failed for device %s to %s: %s",
                   device_id, target_table, exc)
         raise
 
+    if stats["skipped_existing"]:
+        log.warning("Skipped %d slot(s) for device %s in %s: a real item already "
+                    "exists at that key (not overwritten)",
+                    stats["skipped_existing"], device_id, target_table)
     log.info("Wrote %d reconstructed rows for device %s back to %s",
-             written, device_id, target_table)
+             stats["written"], device_id, target_table)
+    return stats
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -475,35 +599,29 @@ def _put(key: str, body: bytes):
 #   WS_Reconstruction_Metadata is keyed by DeviceId and stores a per-sensor
 #   watermark so a run can skip sensors whose data has not advanced.
 #   Attributes: DeviceId, LastProcessed (run time, ISO-8601 UTC),
-#               LastDataTimestamp (newest source TimeStamp seen), GapCount.
+#               LastDataTimestamp (newest ORIGINAL source TimeStamp seen),
+#               GapCount, FilledCount, UnresolvedCount.
 #   Reads/writes here are best-effort: any failure logs and degrades to
 #   "process the sensor" so a metadata problem never blocks reconstruction.
 # ──────────────────────────────────────────────────────────────────────────────
 def probe_latest_source_ts(table_name: str, device_id: str) -> str | None:
-    """Cheaply fetch just the newest TimeStamp for a device (1 item read).
+    """Cheaply fetch the newest ORIGINAL TimeStamp for a device.
 
-    Queries the data table with ScanIndexForward=False and Limit=1 so the
-    incremental check can decide "has new data?" without reading full history.
-    Returns the timestamp string, or None on empty/failure (caller treats None
-    as "process the sensor").
+    Queries the data table newest-first (a small page, normally one read) and
+    skips rows this pipeline wrote earlier, so reconstructed rows never count as
+    "new data". Returns the timestamp string, or None on empty/failure (caller
+    treats None as "process the sensor").
     """
     try:
-        table = _dynamo.Table(table_name)
-        resp = table.query(
-            KeyConditionExpression=Key(config.DATA_PK).eq(str(device_id)),
-            ScanIndexForward=False,
-            Limit=1,
-            ProjectionExpression="#ts",
-            ExpressionAttributeNames={"#ts": config.DATA_SK},
-        )
+        item = _newest_original_item(table_name, device_id, projection="#ts",
+                                     names={"#ts": config.DATA_SK})
     except Exception as exc:
         log.warning("Latest-ts probe failed for %s in %s: %s (will process)",
                     device_id, table_name, exc)
         return None
-    items = resp.get("Items", [])
-    if not items:
+    if not item:
         return None
-    raw = items[0].get(config.DATA_SK)
+    raw = item.get(config.DATA_SK)
     if raw is None:
         return None
     parsed = parse_timestamps(pd.Series([raw]))
@@ -553,8 +671,15 @@ def has_new_data(metadata: dict | None, latest_ts: str | None) -> bool:
 
 
 def put_reconstruction_metadata(device_id: str, last_data_ts: str | None,
-                                gap_count: int) -> None:
-    """Upsert the per-sensor watermark after a successful reconstruction."""
+                                gap_count: int, filled_count: int | None = None,
+                                unresolved_count: int | None = None) -> None:
+    """Upsert the per-sensor watermark after a successful reconstruction.
+
+    GapCount        : all non-original (gap) slots found = filled + unresolved
+                      (+ any reconstructed slot skipped because a real item existed).
+    FilledCount     : reconstructed slots actually written to the source table.
+    UnresolvedCount : gap slots that could not be reconstructed (not written).
+    """
     try:
         table = _dynamo.Table(config.METADATA_TABLE)
         item = {
@@ -563,6 +688,10 @@ def put_reconstruction_metadata(device_id: str, last_data_ts: str | None,
                 "%Y-%m-%dT%H:%M:%SZ"),
             "GapCount": int(gap_count),
         }
+        if filled_count is not None:
+            item["FilledCount"] = int(filled_count)
+        if unresolved_count is not None:
+            item["UnresolvedCount"] = int(unresolved_count)
         if last_data_ts:
             item["LastDataTimestamp"] = str(last_data_ts)
         table.put_item(Item=item)

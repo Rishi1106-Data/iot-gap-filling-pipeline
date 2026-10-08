@@ -1,0 +1,5 @@
+# Everything needed to run the full test suite (local pipeline + AWS layers).
+-r requirements.txt
+-r aws/production/requirements.txt
+pytest>=8.0
+moto[dynamodb,s3]>=5.0,<6

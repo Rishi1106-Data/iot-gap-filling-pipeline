@@ -122,7 +122,8 @@ def reconstruct_one(device_key: str) -> dict:
     if not gap_info["has_work"]:
         log.info("SKIPPED_NO_GAPS device=%s", device_key)
         if getattr(config, "INCREMENTAL_ENABLED", False):
-            io.put_reconstruction_metadata(device_id, latest_data_ts, 0)
+            io.put_reconstruction_metadata(device_id, latest_data_ts, 0,
+                                           filled_count=0, unresolved_count=0)
         t["total_s"] = round(time.perf_counter() - t0, 2)
         return {"device": device_key, "status": "skipped_no_gaps", **t}
 
@@ -144,23 +145,36 @@ def reconstruct_one(device_key: str) -> dict:
                                             model_key=device_id)
 
     _t = time.perf_counter()
-    io.write_output(device_id, result["final_df"], result["reports"],
-                    target_table)
+    write_stats = io.write_output(device_id, result["final_df"],
+                                  result["reports"], target_table)
     t["write_s"] = round(time.perf_counter() - _t, 2)
+
+    # Filled (reconstructed + written) and unresolved slots are counted
+    # separately; unresolved slots are never written to the sensor table.
+    counts = io.summarize_reconstruction(result["final_df"], write_stats)
 
     # Record watermark for incremental processing (Improvement 2).
     if getattr(config, "INCREMENTAL_ENABLED", False):
-        gap_count = int(result["final_df"]["filled_flag"].sum())
-        io.put_reconstruction_metadata(device_id, latest_data_ts, gap_count)
+        io.put_reconstruction_metadata(
+            device_id, latest_data_ts, counts["gap_count"],
+            filled_count=counts["filled"],
+            unresolved_count=counts["unresolved"])
 
     t.update(result.get("timings", {}))
     t["total_s"] = round(time.perf_counter() - t0, 2)
     _log_timing(device_key, t)
 
     rows = len(result["final_df"])
-    filled = int(result["final_df"]["filled_flag"].sum())
+    log.info("RECONSTRUCTED device=%s filled=%d unresolved=%d",
+             device_key, counts["filled"], counts["unresolved"])
+    if counts["unresolved"]:
+        log.warning("UNRESOLVED device=%s unresolved_slots=%d filled_slots=%d "
+                    "(not written to the sensor table)",
+                    device_key, counts["unresolved"], counts["filled"])
     return {"device": device_key, "status": "ok", "rows": rows,
-            "filled": filled, "interval_min": result["interval_min"], **t}
+            "filled": counts["filled"], "unresolved": counts["unresolved"],
+            "skipped_existing": counts["skipped_existing"],
+            "interval_min": result["interval_min"], **t}
 
 
 def write_batch_summary(results: list[dict], started_at: float):
@@ -272,9 +286,9 @@ def main():
     skipped_new = sum(r["status"] == "skipped_no_new_data" for r in results)
 
     # Correction 2: "sensors successfully reconstructed" — count a sensor ONLY
-    # when it completed AND at least one gap-filled record was written back to
-    # DynamoDB (filled >= 1). Sensors with no gaps, no data, or that filled
-    # nothing do not count. This is distinct from the visited-progress [i/N]
+    # when it completed AND at least one reconstructed record was written back to
+    # DynamoDB (filled >= 1). Unresolved slots are not "filled", so a sensor whose
+    # gaps were all unresolved does not count, nor do sensors with no gaps or no data. This is distinct from the visited-progress [i/N]
     # indicator, which still tracks how many sensors have been processed.
     reconstructed = sum(1 for r in results
                         if r["status"] == "ok" and r.get("filled", 0) >= 1)
@@ -285,10 +299,17 @@ def main():
     elapsed = time.time() - started_at
     log.info("Batch done in %.1f min: %d reconstructed, %d ok, %d skipped_no_gaps, "
              "%d skipped_no_new_data, %d no_data, %d failed (of %d) | "
-             "neighbour cache hits=%d misses=%d",
+             "neighbour cache hits=%d misses=%d | filled slots=%d unresolved slots=%d",
              elapsed / 60, reconstructed, ok, skipped, skipped_new, no_data,
-             failed, len(keys), cache.get("hits", 0), cache.get("misses", 0))
+             failed, len(keys), cache.get("hits", 0), cache.get("misses", 0),
+             sum(r.get("filled", 0) for r in results),
+             sum(r.get("unresolved", 0) for r in results))
 
     # Exit non-zero only if EVERY sensor failed — a few bad sensors are normal
     # and should not flag the whole scheduled task as failed (avoids noisy alarms).
-    
+    if keys and failed == len(keys):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,11 @@
 # =============================================================================
 # .github/workflows/deploy.yml
-# Test → Build → Push to ECR → Register task defs → Update state machine.
-# Deploy steps run ONLY on push to main AND only if tests pass.
+# CI: tests + import/syntax checks run on every push and pull request.
+#
+# The build-deploy job deploys the LEGACY design (S3 CSV + Step Functions,
+# aws/ + infrastructure/). It is NOT the current production path — production
+# is deployed with Terraform from aws/production/ (see aws/production/DEPLOY.md).
+# It therefore runs ONLY when started manually (workflow_dispatch).
 # Auth via GitHub OIDC (no static AWS keys).
 # =============================================================================
 name: deploy
@@ -34,14 +38,10 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies (pipeline + AWS layer + test tools)
+      - name: Install dependencies (pipeline + AWS layers + test tools)
         run: |
           python -m pip install --upgrade pip
-          # requirements.txt.txt is the committed pipeline deps file in this repo
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; \
-          elif [ -f requirements.txt.txt ]; then pip install -r requirements.txt.txt; fi
-          pip install -r aws/requirements-aws.txt
-          pip install pytest moto
+          pip install -r requirements-dev.txt
 
       - name: Run pipeline test suite (if present)
         run: |
@@ -52,7 +52,10 @@ jobs:
             echo "No tests/ directory found; skipping unit tests."
           fi
 
-      - name: Smoke-test AWS layer imports
+      - name: Compile-check all Python sources
+        run: python -m compileall -q src aws tests run_pipeline.py
+
+      - name: Smoke-test legacy AWS layer imports
         # Guards against breaking the verified import quirk or aws/ modules.
         run: |
           python - <<'PY'
@@ -72,7 +75,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-deploy:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
